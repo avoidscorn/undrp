@@ -8,9 +8,10 @@ from PIL import Image
 from .io import TrackingOutputStream
 
 
-CONTENT_STREAM = b"""\
+
+CONTENT_STREAM_TEMPLATE = """\
 q
-612 0 0 792 0 0 cm
+{width} 0 0 {height} 0 0 cm
 /Img Do
 Q
 """
@@ -111,7 +112,7 @@ def write_image(out, id_stream, image):
     out.write(bs)
     out.write(b"\nendstream\n")
     out.write(b"endobj\n")
-    return Result(id=image_id, xrefs={image_id: image_pos})
+    return Result(height=height, id=image_id, xrefs={image_id: image_pos}, width=width)
 
 
 def write_object_header(out, id, gen):
@@ -141,17 +142,19 @@ def write_objects(out, id_stream, pages):
 
 
 def write_page(out, id_stream, page, parent_id):
-    def write_content_stream():
+    def write_content_stream(*, height, width):
+        content_stream = as_ascii(CONTENT_STREAM_TEMPLATE.format(height=height, width=width))
+
         content_id = next(id_stream)
         xrefs = {content_id: out.tell()}
         write_object_header(out, content_id, 0)
         out.write(b"<<\n")
         out.write(b"/Length ")
-        out.write(as_ascii(len(CONTENT_STREAM)))
+        out.write(as_ascii(len(content_stream)))
         out.write(b"\n")
         out.write(b">>\n")
         out.write(b"stream\n")
-        out.write(CONTENT_STREAM)
+        out.write(content_stream)
         out.write(b"endstream\n")
         out.write(b"endobj\n")
         return Result(id=content_id, xrefs=xrefs)
@@ -159,10 +162,12 @@ def write_page(out, id_stream, page, parent_id):
     xrefs = {}
 
     result = write_image(out, id_stream, page.image)
+    height = result.height
     image_id = result.id
+    width = result.width
     xrefs.update(result.xrefs)
 
-    result = write_content_stream()
+    result = write_content_stream(height=height, width=width)
     content_id = result.id
     xrefs.update(result.xrefs)
 
@@ -177,6 +182,11 @@ def write_page(out, id_stream, page, parent_id):
     out.write(b"/Resources << /XObject << /Img ")
     out.write(as_ascii(image_id))
     out.write(b" 0 R >> >>\n")
+    out.write(b"/MediaBox [0 0 ")
+    out.write(as_ascii(width))
+    out.write(b" ")
+    out.write(as_ascii(height))
+    out.write(b"]\n")
     out.write(b"/Contents ")
     out.write(as_ascii(content_id))
     out.write(b" 0 R\n")
@@ -200,7 +210,7 @@ def write_pages_object(out, pages_id, page_ids):
     out.write(b"/Count ")
     out.write(as_ascii(len(page_ids)))
     out.write(b"\n")
-    out.write(b"/MediaBox [0 0 612 792]\n")
+    # out.write(b"/MediaBox [0 0 612 792]\n")
     out.write(b">>\n")
     out.write(b"endobj\n")
     return {pages_id: pos}
