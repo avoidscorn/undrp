@@ -27,7 +27,7 @@ import sys
 
 from undrp import __version__
 from undrp.drp import iter_pages
-from undrp.pdf import write_pdf
+from undrp.pdf import PdfWriter
 
 
 log = logging.getLogger(__name__)
@@ -59,8 +59,11 @@ def main(argv=None):
             with ExitStack() as stack:
                 output_file = stack.enter_context(open_target(target_path))
                 pages = stack.enter_context(iter_pages(source))
-                pages = islice(pages, args.start - 1, args.stop)
-                write_pdf(output_file, pages)
+                pdf_writer = stack.enter_context(PdfWriter(output_file))
+
+                for (i, page) in enumerate(islice(pages, args.start - 1, args.stop), 1):
+                    log.debug("Processing page %d", i)
+                    pdf_writer.write_image_page(contents=page.image)
         return 0
     except ArgsError as e:
         print(e, file=sys.stderr)

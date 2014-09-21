@@ -1,20 +1,16 @@
 """PDF output module."""
+from contextlib import contextmanager
 from io import BytesIO
 from itertools import count
 import logging
 
 from PIL import Image
 
-from .io import TrackingOutputStream
-
-
-
 CONTENT_STREAM_TEMPLATE = """\
 q
 {width} 0 0 {height} 0 0 cm
 /Img Do
-Q
-"""
+Q"""
 
 FORMAT2FILTER = {
     "JPEG": b"/DCTDecode"
@@ -25,219 +21,279 @@ MODE2COLOR_SPACE = {
     "RGB": b"/DeviceRGB"
 }
 
-log = logging.getLogger(__name__)
 
+class PdfWriter(object):
+    log = logging.getLogger(__name__ + ".PdfWriter")
 
-class Result(object):
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
+    def __init__(self, out, *, log=None, owned=True):
+        self.out = out
+        self.owned = owned
+        self._id_stream = count(1)
+        self._page_ids = []
+        self._page_tree_root_id = None
+        self._pos = 0
+        self._xrefs = {}
+        if log is not None:
+            self.log = log
+
+    def __enter__(self):
+        self._write_header()
+        return self
+
+    # noinspection PyUnusedLocal
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        if self.out is None:
+            return
+
+        self._write_header()
+
+        self.log.debug("Closing")
+        page_tree_root_id = self._write_page_tree()
+        catalog_id = self._write_catalog(page_tree_root_id=page_tree_root_id)
+        xref_pos = self._write_xrefs()
+        self._write_trailer(catalog_id=catalog_id)
+        self._write_startxref(xref_pos=xref_pos)
+        self._write_footer()
+        if self.owned:
+            self.out.close()
+        self.out = None
+
+    def next_object_id(self):
+        return next(self._id_stream)
+
+    @contextmanager
+    def start_array(self):
+        self._write_header()
+
+        first = True
+
+        @contextmanager
+        def start_array_element():
+            nonlocal first
+            if first:
+                first = False
+            else:
+                self._write(b" ")
+            yield
+
+        self._write(b"[")
+        yield start_array_element
+        self._write(b"]")
+
+    @contextmanager
+    def start_dict(self):
+        self._write_header()
+
+        @contextmanager
+        def start_dict_entry(key):
+            self._write(b"/")
+            self._write(key)
+            self._write(b" ")
+            yield
+            self._write(b"\n")
+
+        self._write(b"<<\n")
+        yield start_dict_entry
+        self._write(b">>\n")
+
+    @contextmanager
+    def start_object(self, id=None):
+        self._write_header()
+
+        if id is None:
+            id = self.next_object_id()
+        self._xrefs[id] = self._pos
+        self._write(as_ascii(id))
+        self._write(b" 0 obj\n")
+        yield id
+        self._write(b"endobj\n")
+
+    @contextmanager
+    def start_stream(self):
+        self._write_header()
+
+        self._write(b"stream\n")
+        yield
+        self._write(b"\nendstream\n")
+
+    def write_image_page(self, id=None, *, contents, contents_id=None, image_id=None, media_box=None, parent_id=None):
+        self._write_header()
+
+        contents_bytes = contents.read()
+        buf = BytesIO(contents_bytes)
+        image_obj = Image.open(buf)
+        (width, height) = image_obj.size
+        color_space = MODE2COLOR_SPACE[image_obj.mode]
+        filter = FORMAT2FILTER[image_obj.format]
+
+        content_stream = CONTENT_STREAM_TEMPLATE.format(height=height, width=width)
+        if media_box is None:
+            media_box = (0, 0, width, height)
+
+        with self.start_object(image_id) as image_id:
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Type"):
+                    self._write(b"/XObject")
+                with start_dict_entry(b"Subtype"):
+                    self._write(b"/Image")
+                with start_dict_entry(b"Width"):
+                    self._write(width)
+                with start_dict_entry(b"Height"):
+                    self._write(height)
+                with start_dict_entry(b"ColorSpace"):
+                    self._write(color_space)
+                with start_dict_entry(b"BitsPerComponent"):
+                    self._write(b"8")
+                with start_dict_entry(b"Length"):
+                    self._write(len(contents_bytes))
+                with start_dict_entry(b"Filter"):
+                    self._write(filter)
+            with self.start_stream():
+                self._write(contents_bytes)
+
+        with self.start_object(contents_id) as contents_id:
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Length"):
+                    self._write(as_ascii(len(content_stream)))
+            with self.start_stream():
+                self._write(content_stream)
+
+        return self.write_page(
+            id,
+            contents_id=contents_id,
+            media_box=media_box,
+            parent_id=parent_id,
+            resources="<< /XObject << /Img {} 0 R >> >>".format(image_id)
+        )
+
+    def write_page(self, id=None, *, contents_id=None, media_box=None, parent_id=None, resources=None):
+        self._write_header()
+
+        if parent_id is None:
+            parent_id = self._page_tree_root_id = self._page_tree_root_id or self.next_object_id()
+
+        with self.start_object(id) as id:
+            self._page_ids.append(id)
+
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Type"):
+                    self._write(b"/Page")
+                with start_dict_entry(b"Parent"):
+                    self._write_ref(parent_id)
+                if resources is not None:
+                    with start_dict_entry(b"Resources"):
+                        self._write(resources)
+                if media_box is not None:
+                    (ll_x, ll_y, ur_x, ur_y) = media_box
+                    with start_dict_entry(b"MediaBox"):
+                        with self.start_array() as start_array_element:
+                            with start_array_element():
+                                self._write(ll_x)
+                            with start_array_element():
+                                self._write(ll_y)
+                            with start_array_element():
+                                self._write(ur_x)
+                            with start_array_element():
+                                self._write(ur_y)
+                if contents_id is not None:
+                    with start_dict_entry(b"Contents"):
+                        if hasattr(contents_id, "__iter__"):
+                            with self.start_array() as start_array_element:
+                                for id in contents_id:
+                                    with start_array_element():
+                                        self._write_ref(id)
+                        else:
+                            self._write_ref(contents_id)
+        return id
+
+    def _write(self, bs):
+        if self.out is None:
+            raise RuntimeError("PDF writer is closed")
+
+        bs = as_ascii(bs)
+        self.out.write(bs)
+        self._pos += len(bs)
+
+    def _write_catalog(self, id=None, *, page_tree_root_id):
+        with self.start_object(id) as id:
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Type"):
+                    self._write(b"/Catalog")
+                with start_dict_entry(b"Pages"):
+                    self._write_ref(page_tree_root_id)
+        return id
+
+    def _write_footer(self):
+        self.log.debug("Writing PDF footer")
+        self._write(b"%%EOF")
+
+    def _write_header(self):
+        if self._pos != 0:
+            return
+
+        self.log.debug("Writing PDF header")
+        self._write(b"%PDF-1.7\n")
+
+    def _write_page_tree(self):
+        self.log.debug("Writing PDF page tree")
+        with self.start_object(self._page_tree_root_id) as id:
+            self._page_tree_root_id = id
+
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Type"):
+                    self._write(b"/Pages")
+                with start_dict_entry(b"Kids"):
+                    with self.start_array() as start_array_element:
+                        for page_id in self._page_ids:
+                            with start_array_element():
+                                self._write_ref(page_id)
+                with start_dict_entry(b"Count"):
+                    self._write(len(self._page_ids))
+        return id
+
+    def _write_ref(self, id):
+        self._write(as_ascii(id))
+        self._write(b" 0 R")
+
+    def _write_startxref(self, xref_pos):
+        self.log.debug("Writing PDF 'startxref' section")
+        self._write(b"startxref\n")
+        self._write(as_ascii(xref_pos))
+        self._write(b"\n")
+
+    def _write_trailer(self, catalog_id):
+        self.log.debug("Writing PDF 'trailer' section")
+        self._write(b"trailer\n")
+        self._write(b"<<\n")
+        self._write(b"/Size ")
+        self._write(len(self._xrefs) + 1)
+        self._write(b"\n")
+        self._write(b"/Root ")
+        self._write(catalog_id)
+        self._write(b" 0 R\n")
+        self._write(b">>\n")
+
+    def _write_xrefs(self):
+        xref_pos = self._pos
+        
+        def write_entry(id, offset, gen, in_use):
+            self._write(as_ascii(id))
+            self._write(b" 1\n")
+            self._write("{:010d} {:05d} {} \n".format(offset, gen, "n" if in_use else "f").encode("ascii"))
+
+        xref_items = sorted(self._xrefs.items())
+
+        self._write(b"xref\n")
+        write_entry(0, 0, 65535, False)
+        for (id, offset) in xref_items:
+            write_entry(id, offset, 0, True)
+        return xref_pos
 
 
 def as_ascii(obj):
+    if isinstance(obj, bytes):
+        return obj
     return str(obj).encode("ascii")
-
-
-def write_catalog(out, id_stream, pages_id):
-    pos = out.tell()
-    catalog_id = next(id_stream)
-    write_object_header(out, catalog_id, 0)
-    out.write(b"<<\n")
-    out.write(b"/Type /Catalog\n")
-    out.write(b"/Pages ")
-    out.write(as_ascii(pages_id))
-    out.write(b" 0 R\n")
-    out.write(b">>\n")
-    out.write(b"endobj\n")
-    return Result(id=catalog_id, xrefs={catalog_id: pos})
-
-
-def write_footer(out, catalog_id, xrefs):
-    log.debug("Writing PDF footer")
-
-    xref_pos = write_xrefs(out, xrefs)
-
-    out.write(b"trailer\n")
-    out.write(b"<<\n")
-    out.write(b"/Size ")
-    out.write(as_ascii(len(xrefs) + 1))
-    out.write(b"\n")
-    out.write(b"/Root ")
-    out.write(as_ascii(catalog_id))
-    out.write(b" 0 R\n")
-    out.write(b">>\n")
-    out.write(b"startxref\n")
-    out.write(as_ascii(xref_pos))
-    out.write(b"\n")
-    out.write(b"%%EOF\n")
-
-
-def write_header(out):
-    log.debug("Writing PDF header")
-
-    out.write(b"%PDF-1.7\n")
-
-
-def write_image(out, id_stream, image):
-    # TODO: Can we avoid reading the whole image into memory? Maybe only parse the first N bytes to get format, width,
-    # and height?
-    bs = image.read()
-    buf = BytesIO(bs)
-    image_obj = Image.open(buf)
-    (width, height) = image_obj.size
-
-    image_pos = out.tell()
-    image_id = next(id_stream)
-    write_object_header(out, image_id, 0)
-    out.write(b"<<\n")
-    out.write(b"/Type /XObject\n")
-    out.write(b"/Subtype /Image\n")
-    out.write(b"/Width ")
-    out.write(as_ascii(width))
-    out.write(b"\n")
-    out.write(b"/Height ")
-    out.write(as_ascii(height))
-    out.write(b"\n")
-    out.write(b"/ColorSpace ")
-    out.write(MODE2COLOR_SPACE[image_obj.mode])
-    out.write(b"\n")
-    out.write(b"/BitsPerComponent 8\n")
-    out.write(b"/Length ")
-    out.write(as_ascii(len(bs)))
-    out.write(b"\n")
-    out.write(b"/Filter ")
-    out.write(FORMAT2FILTER[image_obj.format])
-    out.write(b"\n")
-    out.write(b">>\n")
-    out.write(b"stream\n")
-    out.write(bs)
-    out.write(b"\nendstream\n")
-    out.write(b"endobj\n")
-    return Result(height=height, id=image_id, xrefs={image_id: image_pos}, width=width)
-
-
-def write_object_header(out, id, gen):
-    out.write(as_ascii(id))
-    out.write(b" ")
-    out.write(as_ascii(gen))
-    out.write(b" obj\n")
-
-
-def write_objects(out, id_stream, pages):
-    xrefs = {}
-    pages_id = next(id_stream)
-    page_ids = []
-    for (i, page) in enumerate(pages, 1):
-        log.debug("Processing page %d", i)
-
-        result = write_page(out, id_stream, page, parent_id=pages_id)
-        xrefs.update(result.xrefs)
-        page_ids.append(result.id)
-    xrefs.update(write_pages_object(out, pages_id, page_ids))
-
-    result = write_catalog(out, id_stream, pages_id)
-    catalog_id = result.id
-    xrefs.update(result.xrefs)
-
-    return Result(catalog_id=catalog_id, xrefs=xrefs)
-
-
-def write_page(out, id_stream, page, parent_id):
-    def write_content_stream(*, height, width):
-        content_stream = as_ascii(CONTENT_STREAM_TEMPLATE.format(height=height, width=width))
-
-        content_id = next(id_stream)
-        xrefs = {content_id: out.tell()}
-        write_object_header(out, content_id, 0)
-        out.write(b"<<\n")
-        out.write(b"/Length ")
-        out.write(as_ascii(len(content_stream)))
-        out.write(b"\n")
-        out.write(b">>\n")
-        out.write(b"stream\n")
-        out.write(content_stream)
-        out.write(b"endstream\n")
-        out.write(b"endobj\n")
-        return Result(id=content_id, xrefs=xrefs)
-
-    xrefs = {}
-
-    result = write_image(out, id_stream, page.image)
-    height = result.height
-    image_id = result.id
-    width = result.width
-    xrefs.update(result.xrefs)
-
-    result = write_content_stream(height=height, width=width)
-    content_id = result.id
-    xrefs.update(result.xrefs)
-
-    page_id = next(id_stream)
-    xrefs[page_id] = out.tell()
-    write_object_header(out, page_id, 0)
-    out.write(b"<<\n")
-    out.write(b"/Type /Page\n")
-    out.write(b"/Parent ")
-    out.write(as_ascii(parent_id))
-    out.write(b" 0 R\n")
-    out.write(b"/Resources << /XObject << /Img ")
-    out.write(as_ascii(image_id))
-    out.write(b" 0 R >> >>\n")
-    out.write(b"/MediaBox [0 0 ")
-    out.write(as_ascii(width))
-    out.write(b" ")
-    out.write(as_ascii(height))
-    out.write(b"]\n")
-    out.write(b"/Contents ")
-    out.write(as_ascii(content_id))
-    out.write(b" 0 R\n")
-    out.write(b">>\n")
-    out.write(b"endobj\n")
-    return Result(id=page_id, xrefs=xrefs)
-
-
-def write_pages_object(out, pages_id, page_ids):
-    pos = out.tell()
-    write_object_header(out, pages_id, 0)
-    out.write(b"<<\n")
-    out.write(b"/Type Pages\n")
-    out.write(b"/Kids [")
-    for (i, page_id) in enumerate(page_ids):
-        if i > 0:
-            out.write(b" ")
-        out.write(as_ascii(page_id))
-        out.write(b" 0 R")
-    out.write(b"]\n")
-    out.write(b"/Count ")
-    out.write(as_ascii(len(page_ids)))
-    out.write(b"\n")
-    # out.write(b"/MediaBox [0 0 612 792]\n")
-    out.write(b">>\n")
-    out.write(b"endobj\n")
-    return {pages_id: pos}
-
-
-def write_pdf(out, pages):
-    log.debug("Starting PDF conversion")
-
-    out = TrackingOutputStream(out)
-    id_stream = count(1)
-    write_header(out)
-    result = write_objects(out, id_stream, pages)
-    write_footer(out, catalog_id=result.catalog_id, xrefs=result.xrefs)
-
-    log.debug("PDF conversion complete!")
-
-def write_xrefs(out, xrefs):
-    def write_xref_entry(id, offset, gen, in_use):
-        out.write(as_ascii(id))
-        out.write(b" 1\n")
-        out.write("{:010d} {:05d} {} \n".format(offset, gen, "n" if in_use else "f").encode("ascii"))
-
-    xref_items = sorted(xrefs.items())
-
-    pos = out.tell()
-    out.write(b"xref\n")
-    write_xref_entry(0, 0, 65535, False)
-    for (id, offset) in xref_items:
-        write_xref_entry(id, offset, 0, True)
-    return pos
