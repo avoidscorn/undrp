@@ -27,10 +27,23 @@ import sys
 
 from undrp import __version__
 from undrp.drp import iter_pages
-from undrp.pdf import PdfWriter
+from undrp.pdf import FitH, PdfOutlineItem, PdfWriter
 
 
 log = logging.getLogger(__name__)
+
+
+def create_outline_entry(*, page, page_id):
+    if page.summary and page.title:
+        title = "{} - {}".format(page.title, page.summary)
+    elif page.summary:
+        title = page.summary
+    elif page.title:
+        title = page.title
+    else:
+        return None
+
+    return PdfOutlineItem(location=FitH(), page_id=page_id, title=title)
 
 
 def main(argv=None):
@@ -61,9 +74,17 @@ def main(argv=None):
                 pages = stack.enter_context(iter_pages(source))
                 pdf_writer = stack.enter_context(PdfWriter(output_file))
 
+                outline_items = []
                 for (i, page) in enumerate(islice(pages, args.start - 1, args.stop), 1):
                     log.debug("Processing page %d", i)
-                    pdf_writer.write_image_page(contents=page.image)
+                    page_id = pdf_writer.write_image_page(contents=page.image)
+
+                    outline_item = create_outline_entry(page=page, page_id=page_id)
+                    if outline_item is not None:
+                        outline_items.append(outline_item)
+                if outline_items:
+                    pdf_writer.write_outline(outline_items)
+
         return 0
     except ArgsError as e:
         print(e, file=sys.stderr)

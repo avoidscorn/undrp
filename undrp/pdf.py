@@ -1,4 +1,6 @@
 """PDF output module."""
+from abc import ABCMeta, abstractmethod
+from codecs import BOM_UTF16_BE
 from contextlib import contextmanager
 from io import BytesIO
 from itertools import count
@@ -22,6 +24,41 @@ MODE2COLOR_SPACE = {
 }
 
 
+class PdfDest(object, metaclass=ABCMeta):
+    @abstractmethod
+    def write(self, write):
+        pass
+
+
+class FitH(PdfDest):
+    def __init__(self, *, top=None):
+        self.top = top
+
+    def write(self, write):
+        write(b"/FitH ")
+        if self.top is not None:
+            write(self.top)
+        else:
+            write(b"null")
+
+
+class PdfOutlineItem(object):
+    __slots__ = ["children", "location", "page_id", "title"]
+
+    def __init__(self, *, children=None, location=None, page_id=None, title=None):
+        if children is None:
+            children = []
+
+        self.children = children
+        self.location = location
+        self.page_id = page_id
+        self.title = title
+
+    @property
+    def count(self):
+        return sum(child.count for child in self.children)
+
+
 class PdfWriter(object):
     log = logging.getLogger(__name__ + ".PdfWriter")
 
@@ -29,6 +66,7 @@ class PdfWriter(object):
         self.out = out
         self.owned = owned
         self._id_stream = count(1)
+        self._outline_root_id = None
         self._page_ids = []
         self._page_tree_root_id = None
         self._pos = 0
@@ -52,7 +90,7 @@ class PdfWriter(object):
 
         self.log.debug("Closing")
         page_tree_root_id = self._write_page_tree()
-        catalog_id = self._write_catalog(page_tree_root_id=page_tree_root_id)
+        catalog_id = self._write_catalog(outline_root_id=self._outline_root_id, page_tree_root_id=page_tree_root_id)
         xref_pos = self._write_xrefs()
         self._write_trailer(catalog_id=catalog_id)
         self._write_startxref(xref_pos=xref_pos)
@@ -169,6 +207,81 @@ class PdfWriter(object):
             resources="<< /XObject << /Img {} 0 R >> >>".format(image_id)
         )
 
+    def write_outline(self, items):
+        if self._outline_root_id is not None:
+            raise RuntimeError("Outline already written")
+
+        items = list(items)
+        if not items:
+            return
+
+        root_id = self.next_object_id()
+
+        # Use depth-first traversal to get ids for each item.
+        item2id = {}
+        def visit_item(item):
+            if item in item2id:
+                raise RuntimeError("Duplicate outline item detected")
+            item2id[item] = self.next_object_id()
+            for child in item.children:
+                visit_item(child)
+        for item in items:
+            visit_item(item)
+
+        def write_item(item, *, next_id, parent_id, prev_id):
+            item_id = item2id[item]
+
+            with self.start_object(item_id):
+                with self.start_dict() as start_dict_entry:
+                    with start_dict_entry(b"Title"):
+                        self._write_str(item.title)
+                    with start_dict_entry(b"Parent"):
+                        self._write_ref(parent_id)
+                    if prev_id is not None:
+                        with start_dict_entry(b"Prev"):
+                            self._write_ref(prev_id)
+                    if next_id is not None:
+                        with start_dict_entry(b"Next"):
+                            self._write_ref(next_id)
+                    if item.children:
+                        with start_dict_entry(b"First"):
+                            self._write_ref(item2id[item.children[0]])
+                        with start_dict_entry(b"Last"):
+                            self._write_ref(item2id[item.children[-1]])
+                        with start_dict_entry(b"Count"):
+                            self._write(item.count)
+                    with start_dict_entry(b"Dest"):
+                        with self.start_array() as start_array_item:
+                            with start_array_item():
+                                self._write_ref(item.page_id)
+                            with start_array_item():
+                                item.location.write(self._write)
+
+            write_items(item.children, parent_id=item_id)
+
+        def write_items(items, parent_id):
+            for i in range(len(items)):
+                write_item(
+                    items[i],
+                    next_id=item2id[items[i + 1]] if i + 1 < len(items) else None,
+                    parent_id=parent_id,
+                    prev_id=item2id[items[i - 1]] if i > 0 else None
+                )
+
+        with self.start_object(root_id):
+            with self.start_dict() as start_dict_entry:
+                with start_dict_entry(b"Type"):
+                    self._write(b"/Outlines")
+                with start_dict_entry(b"First"):
+                    self._write_ref(item2id[items[0]])
+                with start_dict_entry(b"Last"):
+                    self._write_ref(item2id[items[-1]])
+                with start_dict_entry(b"Count"):
+                    self._write(len(item2id))
+        write_items(items, parent_id=root_id)
+        self._outline_root_id = root_id
+        return root_id
+
     def write_page(self, id=None, *, contents_id=None, media_box=None, parent_id=None, resources=None):
         self._write_header()
 
@@ -217,11 +330,14 @@ class PdfWriter(object):
         self.out.write(bs)
         self._pos += len(bs)
 
-    def _write_catalog(self, id=None, *, page_tree_root_id):
+    def _write_catalog(self, id=None, *, outline_root_id=None, page_tree_root_id):
         with self.start_object(id) as id:
             with self.start_dict() as start_dict_entry:
                 with start_dict_entry(b"Type"):
                     self._write(b"/Catalog")
+                if outline_root_id is not None:
+                    with start_dict_entry(b"Outlines"):
+                        self._write_ref(outline_root_id)
                 with start_dict_entry(b"Pages"):
                     self._write_ref(page_tree_root_id)
         return id
@@ -264,6 +380,18 @@ class PdfWriter(object):
         self._write(as_ascii(xref_pos))
         self._write(b"\n")
 
+    def _write_str(self, chars):
+        bs = as_ascii(chars)
+        # bs = chars.encode("utf-16be")
+        bs = bs.replace(b"\\", rb"\\")
+        bs = bs.replace(b"(", rb"\(")
+        bs = bs.replace(b")", rb"\)")
+
+        self._write(b"(")
+        # self._write(BOM_UTF16_BE)
+        self._write(bs)
+        self._write(b")")
+
     def _write_trailer(self, catalog_id):
         self.log.debug("Writing PDF 'trailer' section")
         self._write(b"trailer\n")
@@ -297,3 +425,8 @@ def as_ascii(obj):
     if isinstance(obj, bytes):
         return obj
     return str(obj).encode("ascii")
+
+
+# Cleanup
+del ABCMeta
+del abstractmethod
