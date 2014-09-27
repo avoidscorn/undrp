@@ -435,18 +435,35 @@ class PdfWriter(object):
 
     def _write_xrefs(self):
         xref_pos = self._pos
-        
-        def write_entry(id, offset, gen, in_use):
-            self._write(as_ascii(id))
-            self._write(b" 1\n")
-            self._write("{:010d} {:05d} {} \n".format(offset, gen, "n" if in_use else "f").encode("ascii"))
 
-        xref_items = sorted(self._xrefs.items())
+        def group_sequential(xrefs):
+            xrefs = sorted(xrefs)
+
+            pending = []
+            for (id, offset) in xrefs:
+                if pending and id != pending[-1][0] + 1:
+                    yield pending
+                    pending = []
+                pending.append((id, offset))
+            if pending:
+                yield pending
+
+        def write_entry(offset, gen, in_use):
+            self._write("{:010d} {:05d} {} \n".format(offset, gen, "n" if in_use else "f"))
+
+        def write_group_header(start_id, count):
+            self._write(start_id)
+            self._write(b" ")
+            self._write(count)
+            self._write(b"\n")
 
         self._write(b"xref\n")
-        write_entry(0, 0, 65535, False)
-        for (id, offset) in xref_items:
-            write_entry(id, offset, 0, True)
+        write_group_header(0, 1)
+        write_entry(0, 65535, False)
+        for group in group_sequential(self._xrefs.items()):
+            write_group_header(group[0][0], len(group))
+            for (_, offset) in group:
+                write_entry(offset, 0, True)
         return xref_pos
 
 
