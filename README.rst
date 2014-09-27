@@ -45,5 +45,3 @@ LIMITATIONS
 * Error reporting is terrible.
 * Cannot convert EPUB files with DRM. You will need to strip the DRM off first.
 * Can only output to PDF format.
-* No PDF outline support.
-* No thumbnail support.
