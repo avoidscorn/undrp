@@ -77,7 +77,7 @@ def main(argv=None):
                 outline_items = []
                 for (i, page) in enumerate(islice(pages, args.start - 1, args.stop), 1):
                     log.debug("Processing page %d", i)
-                    page_id = pdf_writer.write_image_page(contents=page.image)
+                    page_id = pdf_writer.write_image_page(image=page.image, thumbnail=page.thumbnail_image)
 
                     outline_item = create_outline_entry(page=page, page_id=page_id)
                     if outline_item is not None:

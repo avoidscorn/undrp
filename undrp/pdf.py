@@ -157,42 +157,25 @@ class PdfWriter(object):
         yield
         self._write(b"\nendstream\n")
 
-    def write_image_page(self, id=None, *, contents, contents_id=None, image_id=None, media_box=None, parent_id=None):
+    def write_image_page(
+        self,
+        id=None,
+        *,
+        image,
+        media_box=None,
+        parent_id=None,
+        thumbnail=None
+    ):
         self._write_header()
 
-        contents_bytes = contents.read()
-        buf = BytesIO(contents_bytes)
-        image_obj = Image.open(buf)
-        (width, height) = image_obj.size
-        color_space = MODE2COLOR_SPACE[image_obj.mode]
-        filter = FORMAT2FILTER[image_obj.format]
+        thumbnail_result = thumbnail and self._write_image(image=thumbnail, subtype=False, type=False)
+        image_result = self._write_image(image=image, subtype=True, type=True)
 
-        content_stream = CONTENT_STREAM_TEMPLATE.format(height=height, width=width)
+        content_stream = CONTENT_STREAM_TEMPLATE.format(height=image_result.height, width=image_result.width)
         if media_box is None:
-            media_box = (0, 0, width, height)
+            media_box = (0, 0, image_result.width, image_result.height)
 
-        with self.start_object(image_id) as image_id:
-            with self.start_dict() as start_dict_entry:
-                with start_dict_entry(b"Type"):
-                    self._write(b"/XObject")
-                with start_dict_entry(b"Subtype"):
-                    self._write(b"/Image")
-                with start_dict_entry(b"Width"):
-                    self._write(width)
-                with start_dict_entry(b"Height"):
-                    self._write(height)
-                with start_dict_entry(b"ColorSpace"):
-                    self._write(color_space)
-                with start_dict_entry(b"BitsPerComponent"):
-                    self._write(b"8")
-                with start_dict_entry(b"Length"):
-                    self._write(len(contents_bytes))
-                with start_dict_entry(b"Filter"):
-                    self._write(filter)
-            with self.start_stream():
-                self._write(contents_bytes)
-
-        with self.start_object(contents_id) as contents_id:
+        with self.start_object() as contents_id:
             with self.start_dict() as start_dict_entry:
                 with start_dict_entry(b"Length"):
                     self._write(as_ascii(len(content_stream)))
@@ -204,7 +187,8 @@ class PdfWriter(object):
             contents_id=contents_id,
             media_box=media_box,
             parent_id=parent_id,
-            resources="<< /XObject << /Img {} 0 R >> >>".format(image_id)
+            resources="<< /XObject << /Img {} 0 R >> >>".format(image_result.id),
+            thumbnail_id=thumbnail_result and thumbnail_result.id
         )
 
     def write_outline(self, items):
@@ -282,7 +266,16 @@ class PdfWriter(object):
         self._outline_root_id = root_id
         return root_id
 
-    def write_page(self, id=None, *, contents_id=None, media_box=None, parent_id=None, resources=None):
+    def write_page(
+        self,
+        id=None,
+        *,
+        contents_id=None,
+        media_box=None,
+        parent_id=None,
+        resources=None,
+        thumbnail_id=None
+    ):
         self._write_header()
 
         if parent_id is None:
@@ -320,6 +313,9 @@ class PdfWriter(object):
                                         self._write_ref(id)
                         else:
                             self._write_ref(contents_id)
+                if thumbnail_id is not None:
+                    with start_dict_entry(b"Thumb"):
+                        self._write_ref(thumbnail_id)
         return id
 
     def _write(self, bs):
@@ -352,6 +348,39 @@ class PdfWriter(object):
 
         self.log.debug("Writing PDF header")
         self._write(b"%PDF-1.7\n")
+
+    def _write_image(self, id=None, *, image, subtype=True, type=True):
+        image_bytes = image.read()
+        buf = BytesIO(image_bytes)
+        image_obj = Image.open(buf)
+        (width, height) = image_obj.size
+        color_space = MODE2COLOR_SPACE[image_obj.mode]
+        filter = FORMAT2FILTER[image_obj.format]
+
+        with self.start_object(id) as id:
+            with self.start_dict() as start_dict_entry:
+                if type:
+                    with start_dict_entry(b"Type"):
+                        self._write(b"/XObject")
+                if subtype:
+                    with start_dict_entry(b"Subtype"):
+                        self._write(b"/Image")
+                with start_dict_entry(b"Width"):
+                    self._write(width)
+                with start_dict_entry(b"Height"):
+                    self._write(height)
+                with start_dict_entry(b"ColorSpace"):
+                    self._write(color_space)
+                with start_dict_entry(b"BitsPerComponent"):
+                    self._write(b"8")
+                with start_dict_entry(b"Length"):
+                    self._write(len(image_bytes))
+                with start_dict_entry(b"Filter"):
+                    self._write(filter)
+            with self.start_stream():
+                self._write(image_bytes)
+
+        return Result(height=height, id=id, width=width)
 
     def _write_page_tree(self):
         self.log.debug("Writing PDF page tree")
@@ -419,6 +448,11 @@ class PdfWriter(object):
         for (id, offset) in xref_items:
             write_entry(id, offset, 0, True)
         return xref_pos
+
+
+class Result(object):
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 def as_ascii(obj):
